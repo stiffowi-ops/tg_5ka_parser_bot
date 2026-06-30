@@ -8,47 +8,95 @@ from playwright.sync_api import sync_playwright
 
 
 PRODUCT_HINT_KEYS = {
-    "name", "title", "product_name", "display_name",
-    "brand", "brand_name",
-    "manufacturer", "manufacturer_name",
-    "vendor", "supplier", "producer",
-    "category", "category_name",
-    "url", "slug",
+    "name",
+    "title",
+    "product_name",
+    "display_name",
+    "productName",
+    "product_name",
+    "brand",
+    "brand_name",
+    "brandName",
+    "manufacturer",
+    "manufacturer_name",
+    "manufacturerName",
+    "vendor",
+    "vendor_name",
+    "supplier",
+    "supplier_name",
+    "producer",
+    "producer_name",
+    "category",
+    "category_name",
+    "categoryName",
+    "url",
+    "slug",
+    "link",
+    "href",
 }
 
 NAME_KEYS = [
     "name",
     "title",
     "product_name",
+    "productName",
     "display_name",
+    "displayName",
+    "caption",
 ]
 
 BRAND_KEYS = [
     "brand",
     "brand_name",
+    "brandName",
     "trade_mark",
     "trademark",
+    "tradeMark",
+    "tm",
 ]
 
 MANUFACTURER_KEYS = [
     "manufacturer",
     "manufacturer_name",
+    "manufacturerName",
     "producer",
     "producer_name",
+    "producerName",
     "vendor",
     "vendor_name",
+    "vendorName",
     "supplier",
     "supplier_name",
+    "supplierName",
     "company",
+    "company_name",
+    "companyName",
     "legal_entity",
+    "legalEntity",
     "organization",
+    "organization_name",
 ]
 
 CATEGORY_KEYS = [
     "category",
     "category_name",
+    "categoryName",
     "section",
+    "section_name",
     "parent_category",
+    "parentCategory",
+    "group",
+    "group_name",
+]
+
+PRICE_KEYS = [
+    "price",
+    "current_price",
+    "currentPrice",
+    "regular_price",
+    "regularPrice",
+    "old_price",
+    "oldPrice",
 ]
 
 
@@ -65,6 +113,10 @@ def clean_text(value):
 
 
 def get_by_keys(obj, keys):
+    """
+    Ищет первое непустое значение по списку ключей.
+    Работает с обычными dict, вложенными dict и простыми списками.
+    """
     if not isinstance(obj, dict):
         return ""
 
@@ -80,18 +132,35 @@ def get_by_keys(obj, keys):
         if isinstance(value, dict):
             nested = get_by_keys(
                 value,
-                NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS
+                NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS + PRICE_KEYS
             )
             if nested:
                 return nested
 
         elif isinstance(value, list):
-            result = "; ".join(clean_text(x) for x in value if clean_text(x))
+            values = []
+
+            for item in value:
+                if isinstance(item, dict):
+                    nested = get_by_keys(
+                        item,
+                        NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS + PRICE_KEYS
+                    )
+                    if nested:
+                        values.append(nested)
+                else:
+                    text = clean_text(item)
+                    if text:
+                        values.append(text)
+
+            result = "; ".join(values)
+
             if result:
                 return result
 
         else:
             text = clean_text(value)
+
             if text:
                 return text
 
@@ -99,18 +168,32 @@ def get_by_keys(obj, keys):
 
 
 def looks_like_product_dict(obj):
+    """
+    Проверяет, похож ли dict на карточку товара.
+    """
     if not isinstance(obj, dict):
         return False
 
-    keys = {str(k).lower() for k in obj.keys()}
+    keys = {str(k) for k in obj.keys()}
+    keys_lower = {str(k).lower() for k in obj.keys()}
 
-    has_product_key = bool(keys & PRODUCT_HINT_KEYS)
+    has_product_key = bool(keys_lower & {k.lower() for k in PRODUCT_HINT_KEYS})
     has_name = any(k in obj and clean_text(obj.get(k)) for k in NAME_KEYS)
 
-    return has_product_key and has_name
+    # Иногда товар называется title/name, но ключи другие.
+    # Тогда проверяем наличие цены, бренда, ссылки или категории.
+    has_secondary_product_sign = any(
+        k in obj and clean_text(obj.get(k))
+        for k in BRAND_KEYS + CATEGORY_KEYS + PRICE_KEYS + ["url", "link", "href", "slug"]
+    )
+
+    return has_product_key and has_name and has_secondary_product_sign
 
 
 def find_product_dicts(data):
+    """
+    Рекурсивно проходит по JSON и вытаскивает объекты, похожие на товары.
+    """
     found = []
 
     if isinstance(data, dict):
@@ -127,20 +210,33 @@ def find_product_dicts(data):
     return found
 
 
-def normalize_product(raw, source_url):
-    name = get_by_keys(raw, NAME_KEYS)
-    brand = get_by_keys(raw, BRAND_KEYS)
-    manufacturer = get_by_keys(raw, MANUFACTURER_KEYS)
-    category = get_by_keys(raw, CATEGORY_KEYS)
+def extract_from_characteristics(raw):
+    """
+    Достаёт бренд/производителя/категорию из характеристик,
+    если сайт отдаёт их не отдельными полями.
+    """
+    result = {
+        "brand": "",
+        "manufacturer": "",
+        "category": "",
+    }
 
-    for block_key in [
+    if not isinstance(raw, dict):
+        return result
+
+    blocks = [
         "characteristics",
         "properties",
         "attributes",
         "params",
         "details",
-    ]:
-        block = raw.get(block_key) if isinstance(raw, dict) else None
+        "specifications",
+        "features",
+        "options",
+    ]
+
+    for block_key in blocks:
+        block = raw.get(block_key)
 
         if isinstance(block, list):
             for item in block:
@@ -152,73 +248,152 @@ def normalize_product(raw, source_url):
                     or item.get("title")
                     or item.get("key")
                     or item.get("label")
+                    or item.get("property")
                 ).lower()
 
                 item_value = clean_text(
                     item.get("value")
                     or item.get("text")
                     or item.get("description")
+                    or item.get("val")
                 )
 
                 if not item_value:
                     continue
 
-                if not manufacturer and any(
+                if not result["manufacturer"] and any(
                     x in item_name
-                    for x in ["производ", "изготов", "поставщик", "manufacturer", "supplier"]
+                    for x in [
+                        "производ",
+                        "изготов",
+                        "поставщик",
+                        "manufacturer",
+                        "supplier",
+                        "producer",
+                        "vendor",
+                    ]
                 ):
-                    manufacturer = item_value
+                    result["manufacturer"] = item_value
 
-                if not brand and any(
+                if not result["brand"] and any(
                     x in item_name
-                    for x in ["бренд", "марка", "торговая", "brand"]
+                    for x in [
+                        "бренд",
+                        "марка",
+                        "торговая",
+                        "brand",
+                        "trademark",
+                    ]
                 ):
-                    brand = item_value
+                    result["brand"] = item_value
 
-                if not category and any(
+                if not result["category"] and any(
                     x in item_name
-                    for x in ["категор", "раздел", "category"]
+                    for x in [
+                        "категор",
+                        "раздел",
+                        "category",
+                        "section",
+                    ]
                 ):
-                    category = item_value
+                    result["category"] = item_value
 
         elif isinstance(block, dict):
             flat_text = json.dumps(block, ensure_ascii=False)
 
-            if not manufacturer:
+            if not result["manufacturer"]:
                 match = re.search(
-                    r"(?:производитель|изготовитель|manufacturer|producer|supplier)"
+                    r"(?:производитель|изготовитель|manufacturer|producer|supplier|vendor)"
                     r"\"?\s*[:=]\s*\"?([^\",;}]+)",
                     flat_text,
                     flags=re.I,
                 )
                 if match:
-                    manufacturer = clean_text(match.group(1))
+                    result["manufacturer"] = clean_text(match.group(1))
 
-    product_url = get_by_keys(raw, ["url", "link", "href", "product_url"])
+            if not result["brand"]:
+                match = re.search(
+                    r"(?:бренд|brand|trademark|trade_mark)"
+                    r"\"?\s*[:=]\s*\"?([^\",;}]+)",
+                    flat_text,
+                    flags=re.I,
+                )
+                if match:
+                    result["brand"] = clean_text(match.group(1))
 
-    if product_url and product_url.startswith("/"):
+    return result
+
+
+def normalize_url(possible_url, source_url):
+    possible_url = clean_text(possible_url)
+
+    if not possible_url:
+        return source_url
+
+    if possible_url.startswith("http://") or possible_url.startswith("https://"):
+        return possible_url
+
+    if possible_url.startswith("/"):
         parsed = urlparse(source_url)
-        product_url = f"{parsed.scheme}://{parsed.netloc}{product_url}"
+        return f"{parsed.scheme}://{parsed.netloc}{possible_url}"
+
+    return source_url
+
+
+def normalize_product(raw, source_url):
+    """
+    Приводит товар из произвольного JSON сайта к единой структуре.
+    """
+    name = get_by_keys(raw, NAME_KEYS)
+    brand = get_by_keys(raw, BRAND_KEYS)
+    manufacturer = get_by_keys(raw, MANUFACTURER_KEYS)
+    category = get_by_keys(raw, CATEGORY_KEYS)
+    price = get_by_keys(raw, PRICE_KEYS)
+
+    extra = extract_from_characteristics(raw)
+
+    if not brand:
+        brand = extra["brand"]
+
+    if not manufacturer:
+        manufacturer = extra["manufacturer"]
+
+    if not category:
+        category = extra["category"]
+
+    product_url = get_by_keys(raw, ["url", "link", "href", "product_url", "productUrl"])
+    product_url = normalize_url(product_url, source_url)
 
     return {
         "name": name,
         "brand": brand,
         "manufacturer": manufacturer,
         "category": category,
+        "price": price,
         "product_url": product_url or source_url,
     }
 
 
 def parse_products_from_html(html, page_url):
+    """
+    Фоллбэк, если JSON не удалось перехватить.
+    Достаёт хотя бы названия товаров из HTML.
+    """
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    cards = soup.select(
-        "[data-testid*='product'], "
-        "[class*='product'], "
-        "[class*='Product'], "
-        "article"
-    )
+    selectors = [
+        "[data-testid*='product']",
+        "[data-test*='product']",
+        "[data-qa*='product']",
+        "[class*='product']",
+        "[class*='Product']",
+        "[class*='card']",
+        "[class*='Card']",
+        "article",
+    ]
+
+    cards = soup.select(", ".join(selectors))
 
     for card in cards:
         parts = [
@@ -230,7 +405,17 @@ def parse_products_from_html(html, page_url):
         if not parts:
             continue
 
-        name = parts[0]
+        # Убираем слишком короткие и мусорные строки.
+        meaningful_parts = [
+            p for p in parts
+            if len(p) >= 3
+            and not re.fullmatch(r"[\d\s.,₽$€%-]+", p)
+        ]
+
+        if not meaningful_parts:
+            continue
+
+        name = meaningful_parts[0]
 
         if not name or len(name) < 3:
             continue
@@ -240,16 +425,14 @@ def parse_products_from_html(html, page_url):
 
         if a:
             link = a.get("href", "")
-
-            if link.startswith("/"):
-                parsed = urlparse(page_url)
-                link = f"{parsed.scheme}://{parsed.netloc}{link}"
+            link = normalize_url(link, page_url)
 
         products.append({
             "name": name,
             "brand": "",
             "manufacturer": "",
             "category": "",
+            "price": "",
             "product_url": link or page_url,
         })
 
@@ -257,6 +440,9 @@ def parse_products_from_html(html, page_url):
 
 
 def collect_products(start_url, scroll_steps=10, headless=True):
+    """
+    Открывает страницу, собирает JSON-ответы и HTML-карточки.
+    """
     products = []
     seen_names = set()
     captured_json_objects = []
@@ -286,7 +472,7 @@ def collect_products(start_url, scroll_steps=10, headless=True):
             url = response.url.lower()
             content_type = response.headers.get("content-type", "").lower()
 
-            if "json" not in content_type and "/api/" not in url:
+            if "json" not in content_type and "/api/" not in url and "graphql" not in url:
                 return
 
             try:
@@ -326,9 +512,11 @@ def collect_products(start_url, scroll_steps=10, headless=True):
             for product in html_products:
                 key = product["name"].lower()
 
-                if key not in seen_names:
-                    seen_names.add(key)
-                    products.append(product)
+                if not product["name"] or key in seen_names:
+                    continue
+
+                seen_names.add(key)
+                products.append(product)
 
         browser.close()
 
@@ -336,6 +524,11 @@ def collect_products(start_url, scroll_steps=10, headless=True):
 
 
 def group_products_for_excel(products, source_url):
+    """
+    Группирует товары по производителю/поставщику.
+    Если производитель неизвестен — группирует по бренду.
+    Если бренд тоже неизвестен — группирует в общий блок.
+    """
     grouped = defaultdict(lambda: {
         "company": "",
         "brands": set(),
@@ -348,7 +541,7 @@ def group_products_for_excel(products, source_url):
         manufacturer = clean_text(item.get("manufacturer"))
         brand = clean_text(item.get("brand"))
         name = clean_text(item.get("name"))
-        category = clean_text(item.get("category")) or "Каталог 5ka"
+        category = clean_text(item.get("category")) or "Каталог сайта"
         product_url = clean_text(item.get("product_url")) or source_url
 
         company = manufacturer or brand or "Не найдено на карточке товара"
@@ -410,7 +603,11 @@ def group_products_for_excel(products, source_url):
     return rows
 
 
-def parse_5ka_url(url, scroll_steps=10):
+def parse_any_url(url, scroll_steps=10):
+    """
+    Универсальная точка входа для Telegram-бота.
+    Принимает любую публичную ссылку.
+    """
     products = collect_products(
         start_url=url,
         scroll_steps=scroll_steps,
@@ -424,3 +621,11 @@ def parse_5ka_url(url, scroll_steps=10):
         "rows_count": len(rows),
         "rows": rows,
     }
+
+
+def parse_5ka_url(url, scroll_steps=10):
+    """
+    Оставлено для совместимости со старым кодом.
+    Теперь делает то же самое, что parse_any_url.
+    """
+    return parse_any_url(url, scroll_steps)
