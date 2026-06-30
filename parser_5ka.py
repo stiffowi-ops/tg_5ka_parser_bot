@@ -1,5 +1,8 @@
+import os
+import sys
 import json
 import re
+import subprocess
 from collections import defaultdict
 from urllib.parse import urlparse
 
@@ -13,7 +16,8 @@ PRODUCT_HINT_KEYS = {
     "product_name",
     "display_name",
     "productName",
-    "product_name",
+    "displayName",
+    "caption",
     "brand",
     "brand_name",
     "brandName",
@@ -22,10 +26,13 @@ PRODUCT_HINT_KEYS = {
     "manufacturerName",
     "vendor",
     "vendor_name",
+    "vendorName",
     "supplier",
     "supplier_name",
+    "supplierName",
     "producer",
     "producer_name",
+    "producerName",
     "category",
     "category_name",
     "categoryName",
@@ -33,6 +40,9 @@ PRODUCT_HINT_KEYS = {
     "slug",
     "link",
     "href",
+    "price",
+    "current_price",
+    "currentPrice",
 }
 
 NAME_KEYS = [
@@ -100,6 +110,38 @@ PRICE_KEYS = [
 ]
 
 
+def ensure_playwright_browser():
+    """
+    Проверяет/устанавливает Chromium для Playwright.
+    Нужно для хостингов, где pip install playwright не скачивает браузер автоматически.
+    """
+    marker_path = "/tmp/playwright_chromium_installed"
+
+    if os.path.exists(marker_path):
+        return
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        with open(marker_path, "w", encoding="utf-8") as file:
+            file.write("ok")
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            "Не удалось установить Chromium для Playwright.\n\n"
+            "Попробуй добавить в Dockerfile или команду сборки:\n"
+            "python -m playwright install --with-deps chromium\n\n"
+            f"STDOUT:\n{e.stdout}\n\n"
+            f"STDERR:\n{e.stderr}"
+        )
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -126,14 +168,15 @@ def get_by_keys(obj, keys):
 
         value = obj.get(key)
 
-        if not value:
+        if value is None or value == "":
             continue
 
         if isinstance(value, dict):
             nested = get_by_keys(
                 value,
-                NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS + PRICE_KEYS
+                NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS + PRICE_KEYS,
             )
+
             if nested:
                 return nested
 
@@ -144,12 +187,14 @@ def get_by_keys(obj, keys):
                 if isinstance(item, dict):
                     nested = get_by_keys(
                         item,
-                        NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS + PRICE_KEYS
+                        NAME_KEYS + BRAND_KEYS + MANUFACTURER_KEYS + CATEGORY_KEYS + PRICE_KEYS,
                     )
+
                     if nested:
                         values.append(nested)
                 else:
                     text = clean_text(item)
+
                     if text:
                         values.append(text)
 
@@ -174,14 +219,11 @@ def looks_like_product_dict(obj):
     if not isinstance(obj, dict):
         return False
 
-    keys = {str(k) for k in obj.keys()}
     keys_lower = {str(k).lower() for k in obj.keys()}
 
     has_product_key = bool(keys_lower & {k.lower() for k in PRODUCT_HINT_KEYS})
     has_name = any(k in obj and clean_text(obj.get(k)) for k in NAME_KEYS)
 
-    # Иногда товар называется title/name, но ключи другие.
-    # Тогда проверяем наличие цены, бренда, ссылки или категории.
     has_secondary_product_sign = any(
         k in obj and clean_text(obj.get(k))
         for k in BRAND_KEYS + CATEGORY_KEYS + PRICE_KEYS + ["url", "link", "href", "slug"]
@@ -308,6 +350,7 @@ def extract_from_characteristics(raw):
                     flat_text,
                     flags=re.I,
                 )
+
                 if match:
                     result["manufacturer"] = clean_text(match.group(1))
 
@@ -318,6 +361,7 @@ def extract_from_characteristics(raw):
                     flat_text,
                     flags=re.I,
                 )
+
                 if match:
                     result["brand"] = clean_text(match.group(1))
 
@@ -361,7 +405,19 @@ def normalize_product(raw, source_url):
     if not category:
         category = extra["category"]
 
-    product_url = get_by_keys(raw, ["url", "link", "href", "product_url", "productUrl"])
+    product_url = get_by_keys(
+        raw,
+        [
+            "url",
+            "link",
+            "href",
+            "product_url",
+            "productUrl",
+            "canonical_url",
+            "canonicalUrl",
+        ],
+    )
+
     product_url = normalize_url(product_url, source_url)
 
     return {
@@ -405,11 +461,11 @@ def parse_products_from_html(html, page_url):
         if not parts:
             continue
 
-        # Убираем слишком короткие и мусорные строки.
         meaningful_parts = [
             p for p in parts
             if len(p) >= 3
             and not re.fullmatch(r"[\d\s.,₽$€%-]+", p)
+            and p.lower() not in ["купить", "в корзину", "добавить", "подробнее"]
         ]
 
         if not meaningful_parts:
@@ -427,14 +483,16 @@ def parse_products_from_html(html, page_url):
             link = a.get("href", "")
             link = normalize_url(link, page_url)
 
-        products.append({
-            "name": name,
-            "brand": "",
-            "manufacturer": "",
-            "category": "",
-            "price": "",
-            "product_url": link or page_url,
-        })
+        products.append(
+            {
+                "name": name,
+                "brand": "",
+                "manufacturer": "",
+                "category": "",
+                "price": "",
+                "product_url": link or page_url,
+            }
+        )
 
     return products
 
@@ -443,6 +501,8 @@ def collect_products(start_url, scroll_steps=10, headless=True):
     """
     Открывает страницу, собирает JSON-ответы и HTML-карточки.
     """
+    ensure_playwright_browser()
+
     products = []
     seen_names = set()
     captured_json_objects = []
@@ -453,6 +513,8 @@ def collect_products(start_url, scroll_steps=10, headless=True):
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
             ],
         )
 
@@ -472,7 +534,13 @@ def collect_products(start_url, scroll_steps=10, headless=True):
             url = response.url.lower()
             content_type = response.headers.get("content-type", "").lower()
 
-            if "json" not in content_type and "/api/" not in url and "graphql" not in url:
+            if (
+                "json" not in content_type
+                and "/api/" not in url
+                and "graphql" not in url
+                and "catalog" not in url
+                and "product" not in url
+            ):
                 return
 
             try:
@@ -529,13 +597,15 @@ def group_products_for_excel(products, source_url):
     Если производитель неизвестен — группирует по бренду.
     Если бренд тоже неизвестен — группирует в общий блок.
     """
-    grouped = defaultdict(lambda: {
-        "company": "",
-        "brands": set(),
-        "categories": set(),
-        "products": set(),
-        "sources": set(),
-    })
+    grouped = defaultdict(
+        lambda: {
+            "company": "",
+            "brands": set(),
+            "categories": set(),
+            "products": set(),
+            "sources": set(),
+        }
+    )
 
     for item in products:
         manufacturer = clean_text(item.get("manufacturer"))
@@ -584,51 +654,27 @@ def group_products_for_excel(products, source_url):
             if len(products_list) > 8:
                 function += f" и ещё {len(products_list) - 8} поз."
 
-        rows.append({
-            "Юрлицо / компания": company,
-            "Роль": role,
-            "Бренд(ы) в категории": "; ".join(brands_list) if brands_list else company,
-            "Подкатегории / товары из категории": (
-                "; ".join(categories_list)
-                + " / "
-                + "; ".join(products_list[:15])
-            ),
-            "Что производит / функция": function,
-            "УНП": "",
-            "Источник": "; ".join(sources_list[:3]),
-        })
+        rows.append(
+            {
+                "Юрлицо / компания": company,
+                "Роль": role,
+                "Бренд(ы) в категории": "; ".join(brands_list) if brands_list else company,
+                "Подкатегории / товары из категории": (
+                    "; ".join(categories_list)
+                    + " / "
+                    + "; ".join(products_list[:15])
+                ),
+                "Что производит / функция": function,
+                "УНП": "",
+                "Источник": "; ".join(sources_list[:3]),
+            }
+        )
 
     rows.sort(key=lambda x: x["Юрлицо / компания"])
 
     return rows
 
 
-def parse_any_url(url, scroll_steps=10):
-    """
-    Универсальная точка входа для Telegram-бота.
-    Принимает любую публичную ссылку.
-    """
-    products = collect_products(
-        start_url=url,
-        scroll_steps=scroll_steps,
-        headless=True,
-    )
-
-    rows = group_products_for_excel(products, url)
-
-    return {
-        "products_count": len(products),
-        "rows_count": len(rows),
-        "rows": rows,
-    }
-
-
-def parse_5ka_url(url, scroll_steps=10):
-    """
-    Оставлено для совместимости со старым кодом.
-    Теперь делает то же самое, что parse_any_url.
-    """
-    return parse_any_url(url, scroll_steps)
 def parse_any_url(url, scroll_steps=10):
     """
     Универсальная точка входа для Telegram-бота.
