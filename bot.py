@@ -11,7 +11,10 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 
-from parser_5ka import parse_any_url
+try:
+    from parser_5ka import parse_any_url
+except ImportError:
+    from parser_5ka import parse_5ka_url as parse_any_url
 from excel_writer import create_excel_file
 
 
