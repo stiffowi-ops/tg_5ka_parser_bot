@@ -2,6 +2,8 @@ import asyncio
 import os
 import re
 import uuid
+import socket
+import ipaddress
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
@@ -9,7 +11,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 
-from parser_5ka import parse_5ka_url
+from parser_5ka import parse_any_url
 from excel_writer import create_excel_file
 
 
@@ -28,15 +30,6 @@ dp = Dispatcher()
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
-def is_5ka_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
-        return "5ka.ru" in domain
-    except Exception:
-        return False
-
-
 def extract_url(text: str) -> str | None:
     if not text:
         return None
@@ -49,21 +42,81 @@ def extract_url(text: str) -> str | None:
     return match.group(0).strip()
 
 
+def is_public_ip(ip: str) -> bool:
+    """
+    Защита сервера: запрещаем localhost, приватные IP и внутренние адреса.
+    """
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+
+        return not (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+        )
+    except ValueError:
+        return False
+
+
+def is_safe_public_url(url: str) -> tuple[bool, str]:
+    """
+    Проверяем, что пользователь прислал обычную публичную http/https ссылку.
+    Это важно, потому что бот будет открывать ссылку с сервера.
+    """
+    try:
+        parsed = urlparse(url)
+
+        if parsed.scheme not in ["http", "https"]:
+            return False, "Разрешены только ссылки http:// или https://."
+
+        if not parsed.netloc:
+            return False, "Некорректная ссылка."
+
+        hostname = parsed.hostname
+
+        if not hostname:
+            return False, "Не удалось определить домен ссылки."
+
+        blocked_hosts = {
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+        }
+
+        if hostname.lower() in blocked_hosts:
+            return False, "Нельзя отправлять локальные адреса."
+
+        try:
+            ip = socket.gethostbyname(hostname)
+        except socket.gaierror:
+            return False, "Не удалось определить IP-адрес сайта."
+
+        if not is_public_ip(ip):
+            return False, "Нельзя отправлять внутренние или приватные адреса."
+
+        return True, ""
+
+    except Exception:
+        return False, "Ошибка проверки ссылки."
+
+
 async def run_parser_in_thread(url: str, scroll_steps: int = 10):
     """
     Playwright sync-код запускаем в отдельном потоке,
-    чтобы не блокировать event loop Telegram-бота.
+    чтобы не блокировать Telegram-бота.
     """
-    return await asyncio.to_thread(parse_5ka_url, url, scroll_steps)
+    return await asyncio.to_thread(parse_any_url, url, scroll_steps)
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     await message.answer(
-        "Привет! Я могу собрать товары, бренды и поставщиков с 5ka в Excel.\n\n"
-        "Просто отправь мне ссылку на страницу 5ka.\n\n"
-        "Лучше отправлять ссылку на конкретную категорию или поисковую страницу, "
-        "а не главную страницу."
+        "Привет! Я могу собрать товары, бренды и поставщиков/производителей "
+        "с публичной страницы сайта в Excel.\n\n"
+        "Просто отправь мне ссылку на страницу с товарами.\n\n"
+        "Лучше отправлять ссылку на конкретную категорию, каталог или страницу поиска."
     )
 
 
@@ -71,11 +124,13 @@ async def start_handler(message: Message):
 async def help_handler(message: Message):
     await message.answer(
         "Как пользоваться:\n\n"
-        "1. Открой 5ka.ru.\n"
-        "2. Найди нужную категорию или поиск.\n"
+        "1. Открой сайт с товарами.\n"
+        "2. Перейди в нужную категорию или поиск.\n"
         "3. Скопируй ссылку.\n"
         "4. Отправь ссылку мне.\n\n"
-        "Я соберу данные и отправлю Excel-файл."
+        "Я попробую собрать данные и отправлю Excel-файл.\n\n"
+        "Важно: не все сайты отдают производителя или поставщика. "
+        "Если таких данных нет в карточке/API сайта, в Excel будет указано, что данные не найдены."
     )
 
 
@@ -86,20 +141,22 @@ async def parse_link_handler(message: Message):
 
     if not url:
         await message.answer(
-            "Отправь ссылку на страницу 5ka, например:\n"
-            "https://5ka.ru/"
+            "Отправь ссылку на страницу с товарами, например:\n"
+            "https://example.com/catalog"
         )
         return
 
-    if not is_5ka_url(url):
+    is_safe, error_text = is_safe_public_url(url)
+
+    if not is_safe:
         await message.answer(
-            "Пока я умею работать только со ссылками 5ka.ru."
+            f"Я не могу открыть эту ссылку.\n\nПричина: {error_text}"
         )
         return
 
     status_message = await message.answer(
         "Принял ссылку.\n"
-        "Запускаю парсер, собираю товары и готовлю Excel..."
+        "Запускаю парсер, собираю данные и готовлю Excel..."
     )
 
     try:
@@ -112,12 +169,12 @@ async def parse_link_handler(message: Message):
         if not rows:
             await status_message.edit_text(
                 "Не удалось найти товары на этой странице.\n\n"
-                "Попробуй отправить ссылку на конкретную категорию или страницу поиска."
+                "Попробуй отправить ссылку на конкретную категорию, каталог или страницу поиска."
             )
             return
 
         file_id = str(uuid.uuid4())[:8]
-        output_path = os.path.join("output", f"5ka_suppliers_{file_id}.xlsx")
+        output_path = os.path.join("output", f"parsed_suppliers_{file_id}.xlsx")
 
         create_excel_file(
             rows=rows,
