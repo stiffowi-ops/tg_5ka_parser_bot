@@ -1,6 +1,7 @@
 import os
 import re
 import time
+
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -29,7 +30,7 @@ def clean_text(value):
 def safe_sheet_name(name):
     name = re.sub(r"[\[\]\:\*\?\/\\]", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
-    return name[:31] or "Каталог"
+    return name[:31] or "Поставщики"
 
 
 def autosize_columns(ws, max_width=55):
@@ -107,9 +108,9 @@ def create_excel_file(rows, output_path, source_url):
 
     wb = Workbook()
     ws = wb.active
-    ws.title = safe_sheet_name("Поставщики 5ka")
+    ws.title = safe_sheet_name("Поставщики")
 
-    ws.append(["Поставщики и производители 5ka"])
+    ws.append(["Поставщики, производители и бренды"])
     ws.append([
         f"Источник: {source_url} · "
         f"Сформировано автоматически: {time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -133,11 +134,15 @@ def create_excel_file(rows, output_path, source_url):
     ])
     info.append([
         "3",
-        "УНП автоматически не заполняется, потому что 5ka — российская сеть, а УНП актуален для белорусских юрлиц.",
+        "УНП автоматически не заполняется, потому что не каждый сайт отдаёт юридические реквизиты поставщика.",
     ])
     info.append([
         "4",
         "Колонка «Источник» содержит страницу или API-источник, откуда был найден товар.",
+    ])
+    info.append([
+        "5",
+        "Универсальный парсер работает лучше всего со страницами каталогов, категорий и поиска.",
     ])
 
     autosize_columns(info)
