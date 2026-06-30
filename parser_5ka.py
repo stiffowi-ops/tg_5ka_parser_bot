@@ -629,3 +629,29 @@ def parse_5ka_url(url, scroll_steps=10):
     Теперь делает то же самое, что parse_any_url.
     """
     return parse_any_url(url, scroll_steps)
+def parse_any_url(url, scroll_steps=10):
+    """
+    Универсальная точка входа для Telegram-бота.
+    Принимает любую публичную ссылку.
+    """
+    products = collect_products(
+        start_url=url,
+        scroll_steps=scroll_steps,
+        headless=True,
+    )
+
+    rows = group_products_for_excel(products, url)
+
+    return {
+        "products_count": len(products),
+        "rows_count": len(rows),
+        "rows": rows,
+    }
+
+
+def parse_5ka_url(url, scroll_steps=10):
+    """
+    Оставлено для совместимости со старым кодом.
+    Теперь делает то же самое, что parse_any_url.
+    """
+    return parse_any_url(url, scroll_steps)
