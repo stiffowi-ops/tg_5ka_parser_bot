@@ -1,6 +1,10 @@
 import json
+import os
 import re
+import subprocess
+import sys
 from collections import defaultdict
+from pathlib import Path
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -99,6 +103,49 @@ PRICE_KEYS = [
 ]
 
 
+def ensure_playwright_chromium():
+    """
+    Проверяет наличие Chromium для Playwright.
+
+    Важно:
+    - Эта функция вызывается только при запросе на парсинг.
+    - При запуске Telegram-бота Chromium не запускается и не устанавливается.
+    - Браузер сохраняется в папку .playwright-browsers, если не задана другая переменная.
+    """
+    browsers_path = os.getenv("PLAYWRIGHT_BROWSERS_PATH", ".playwright-browsers")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
+
+    browsers_dir = Path(browsers_path)
+
+    chromium_exists = False
+
+    if browsers_dir.exists():
+        for path in browsers_dir.rglob("*"):
+            if path.name in {"chrome", "chrome-headless-shell"} and path.is_file():
+                chromium_exists = True
+                break
+
+    if chromium_exists:
+        return
+
+    print("Chromium для Playwright не найден. Устанавливаю chromium...", flush=True)
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "Не удалось установить Chromium для Playwright. "
+            "На Bothost проверь, хватает ли места и разрешена ли установка браузеров. "
+            "Также попробуй добавить переменную окружения "
+            "PLAYWRIGHT_BROWSERS_PATH=.playwright-browsers"
+        ) from error
+
+    print("Chromium для Playwright установлен.", flush=True)
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -137,6 +184,7 @@ def get_by_keys(obj, keys):
                 + CATEGORY_KEYS
                 + PRICE_KEYS,
             )
+
             if nested:
                 return nested
 
@@ -153,10 +201,12 @@ def get_by_keys(obj, keys):
                         + CATEGORY_KEYS
                         + PRICE_KEYS,
                     )
+
                     if nested:
                         values.append(nested)
                 else:
                     text = clean_text(item)
+
                     if text:
                         values.append(text)
 
@@ -313,6 +363,7 @@ def extract_from_characteristics(raw):
                     flat_text,
                     flags=re.I,
                 )
+
                 if match:
                     result["manufacturer"] = clean_text(match.group(1))
 
@@ -323,6 +374,7 @@ def extract_from_characteristics(raw):
                     flat_text,
                     flags=re.I,
                 )
+
                 if match:
                     result["brand"] = clean_text(match.group(1))
 
@@ -356,13 +408,16 @@ def normalize_price(value):
         for key in ["value", "amount", "price", "current", "regular"]:
             if key in value:
                 return normalize_price(value.get(key))
+
         return ""
 
     if isinstance(value, list):
         for item in value:
             price = normalize_price(item)
+
             if price:
                 return price
+
         return ""
 
     text = clean_text(value)
@@ -764,10 +819,14 @@ def parse_products_from_html(html, page_url):
 def collect_products(start_url, scroll_steps=5, headless=True):
     """
     Открывает страницу, собирает JSON-ответы и HTML-карточки.
+    Chromium устанавливается и запускается только здесь,
+    то есть только после запроса на парсинг.
     """
     products = []
     seen_names = set()
     captured_json_objects = []
+
+    ensure_playwright_chromium()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
